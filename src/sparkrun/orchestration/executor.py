@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 # Default executor settings for DGX Spark GPU workloads.
 # Lowest priority in the config chain: CLI → recipe → these defaults.
 EXECUTOR_DEFAULTS = {
-    "auto_remove": True,
-    "restart_policy": None,
+    "auto_remove": False,
+    "restart_policy": "unless-stopped",
     "privileged": True,
     "gpus": "all",
     "ipc": "host",
@@ -47,8 +47,8 @@ class ExecutorConfig:
     defaults layering.
     """
 
-    auto_remove: bool = True
-    restart_policy: str | None = None
+    auto_remove: bool = False
+    restart_policy: str | None = "unless-stopped"
     privileged: bool = True
     gpus: str = "all"
     ipc: str = "host"
