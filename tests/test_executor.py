@@ -31,8 +31,8 @@ class TestExecutorConfig:
 
     def test_defaults(self):
         cfg = ExecutorConfig()
-        assert cfg.auto_remove is True
-        assert cfg.restart_policy is None
+        assert cfg.auto_remove is False
+        assert cfg.restart_policy == "unless-stopped"
         assert cfg.privileged is True
         assert cfg.gpus == "all"
         assert cfg.ipc == "host"
@@ -187,10 +187,11 @@ class TestDockerExecutorConfig:
         cmd = executor.run_cmd("img:latest")
         assert "--rm" not in cmd
 
-    def test_rm_flag_default(self):
+    def test_restart_flag_default(self):
         executor = DockerExecutor()
         cmd = executor.run_cmd("img:latest")
-        assert "--rm" in cmd
+        assert "--restart unless-stopped" in cmd
+        assert "--rm" not in cmd
 
     def test_restart_policy(self):
         cfg = ExecutorConfig(restart_policy="always")
