@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "description": "AI-assisted inference on NVIDIA DGX Spark - run, manage, and stop LLM workloads with OpenClaw",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "author": {
     "name": "scitrera.ai",
     "email": "open-source-team@scitrera.com"
@@ -45,6 +45,10 @@
     "LICENSE"
   ],
   "devDependencies": {
-    "@types/node": "^25.6.0"
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49"
   }
 }

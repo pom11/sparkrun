@@ -29,10 +29,11 @@ export default definePluginEntry({
                     }),
                 ),
             }),
-            // @ts-ignore
-            execute: async ({command, timeout}) => {
+            execute: async (_id: string, params: Record<string, unknown>) => {
+                const command = params.command as string;
+                const timeout = params.timeout as number | undefined;
                 // Ensure the command starts with sparkrun for safety
-                const trimmed = command.trim();
+                const trimmed = (command ?? "").trim();
                 if (!trimmed.startsWith("sparkrun")) {
                     return {
                         content: [
