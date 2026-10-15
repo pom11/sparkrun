@@ -66,6 +66,7 @@ def build_litellm_config(
     endpoints: list[DiscoveredEndpoint],
     master_key: str | None = DEFAULT_MASTER_KEY,
     aliases: dict[str, str] | None = None,
+    router_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a litellm proxy config dict from discovered endpoints.
 
@@ -91,6 +92,10 @@ def build_litellm_config(
             alias exactly like a real model.  An alias whose target has no
             healthy backend is skipped (it reappears when the target
             returns).
+        router_settings: Optional LiteLLM ``router_settings`` emitted
+            verbatim (e.g. ``{"routing_strategy": "least-busy"}``).  Without
+            it LiteLLM uses ``simple-shuffle``: a random backend per request,
+            blind to how many requests each one is already serving.
 
     Returns:
         Dict suitable for writing as litellm YAML config.
@@ -171,6 +176,9 @@ def build_litellm_config(
 
     if general_settings:
         config["general_settings"] = general_settings
+
+    if router_settings:
+        config["router_settings"] = dict(router_settings)
 
     return config
 
@@ -305,7 +313,9 @@ class ProxyEngine(GatewaySupervisor):
         model group, so the applied/pending split is read back out of the
         rendered config rather than assumed from *aliases*.
         """
-        config_dict = build_litellm_config(endpoints, self.master_key, aliases=aliases)
+        config_dict = build_litellm_config(
+            endpoints, self.master_key, aliases=aliases,
+            router_settings=self._configured_router_settings())
         applied = {entry["model_name"] for entry in config_dict["model_list"]} & set(aliases)
         path = write_config(config_dict) if write else None
         return path, applied, set(aliases) - applied
@@ -509,7 +519,9 @@ class ProxyEngine(GatewaySupervisor):
         if self.is_running():
             self._adopt_running_identity()
 
-        desired = build_litellm_config(endpoints, master_key=self.master_key, aliases=aliases)
+        desired = build_litellm_config(
+            endpoints, master_key=self.master_key, aliases=aliases,
+            router_settings=self._configured_router_settings())
         current = self._load_current_config()
 
         # Preserve auth and any other operator-set general_settings.
@@ -521,7 +533,11 @@ class ProxyEngine(GatewaySupervisor):
         added = len(desired_keys - current_keys)
         removed = len(current_keys - desired_keys)
 
-        if not added and not removed:
+        # LiteLLM reads router_settings only at startup, so a changed routing
+        # policy needs the same rewrite + restart as a changed model set.
+        router_changed = (desired.get("router_settings") or {}) != (current.get("router_settings") or {})
+
+        if not added and not removed and not router_changed:
             logger.debug("Proxy model list already matches discovered endpoints")
             return 0, 0
 
@@ -662,6 +678,16 @@ class ProxyEngine(GatewaySupervisor):
             logger.debug("Could not read litellm config %s", self.config_path, exc_info=True)
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _configured_router_settings(self) -> dict[str, Any]:
+        """Read LiteLLM router_settings from ``proxy.yaml`` (empty when unreadable)."""
+        try:
+            from sparkrun.proxy.config import ProxyConfig
+
+            return ProxyConfig().router_settings
+        except Exception:
+            logger.debug("Could not read configured router_settings", exc_info=True)
+            return {}
 
     def _configured_aliases(self) -> dict[str, str]:
         """Read aliases from ``proxy.yaml`` (empty when unreadable)."""

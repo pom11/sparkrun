@@ -270,6 +270,19 @@ class ProxyConfig:
         proxy.update(kwargs)
         self._pending_proxy.update(copy.deepcopy(kwargs))
 
+    # -- LiteLLM router settings --
+
+    @property
+    def router_settings(self) -> dict[str, Any]:
+        """LiteLLM ``router_settings`` to emit verbatim ({} when unset).
+
+        Set by hand (or by an orchestrator) under a top-level
+        ``router_settings:`` key, e.g. ``routing_strategy: least-busy``.
+        Anything that is not a mapping is ignored.
+        """
+        value = self._data.get("router_settings")
+        return copy.deepcopy(value) if isinstance(value, dict) else {}
+
     # -- Alias management --
 
     @property
