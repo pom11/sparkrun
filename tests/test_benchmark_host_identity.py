@@ -371,9 +371,13 @@ def test_a_genuinely_concurrent_process_is_refused(tmp_path: Path):
     assert q.get(timeout=10) == "refused"
 
 
+def _noop() -> None:
+    """Module-level no-op target (lambdas are unpicklable under macOS spawn)."""
+
+
 def _a_dead_pid() -> int:
     """Return a PID that is not running."""
-    proc = multiprocessing.Process(target=lambda: None)
+    proc = multiprocessing.Process(target=_noop)
     proc.start()
     proc.join()
     return proc.pid
