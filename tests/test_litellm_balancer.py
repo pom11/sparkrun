@@ -352,6 +352,115 @@ def test_empty_candidate_list_is_passed_through():
     assert asyncio.run(lb.async_filter_deployments("g", [], None, {"litellm_trace_id": "t"})) == []
 
 
+def _conv(task: str, system: str = "You are a fleet agent.") -> list:
+    return [{"role": "system", "content": system}, {"role": "user", "content": task}]
+
+
+def _filter_conv(lb: LeastInFlight, deployments: list, call: str, messages: list | None = None, session: str | None = None) -> dict:
+    kwargs = {"litellm_call_id": call, "litellm_trace_id": "trace-%s" % call}
+    if session:
+        kwargs["litellm_session_id"] = session
+    picked = asyncio.run(lb.async_filter_deployments("g", deployments, messages, kwargs))
+    assert len(picked) == 1
+    return picked[0]
+
+
+def test_session_key_prefers_the_explicit_session_id():
+    assert balancer.session_key({"litellm_session_id": "s1"}, _conv("task")) == "session:s1"
+    assert balancer.session_key({"metadata": {"session_id": "s2"}}) == "session:s2"
+
+
+def test_session_key_from_the_prompt_ignores_later_turns_and_the_system_tail():
+    first = _conv("fix bug 6")
+    later = first + [{"role": "assistant", "content": "ok"}, {"role": "tool", "content": "x" * 50}]
+    retimed = [{"role": "system", "content": "You are a fleet agent." + " " * 3000 + "now=23:01"}, first[1]]
+    retimed_later = [{"role": "system", "content": retimed[0]["content"].replace("23:01", "23:09")}, first[1]]
+    key = balancer.session_key({}, first)
+    assert key is not None and key.startswith("prompt:")
+    assert balancer.session_key({}, later) == key
+    assert balancer.session_key({}, retimed) == balancer.session_key({}, retimed_later)
+    assert balancer.session_key({}, _conv("fix bug 7")) != key
+
+
+def test_session_key_needs_a_user_message():
+    assert balancer.session_key({}, None) is None
+    assert balancer.session_key({}, [{"role": "system", "content": "only"}]) is None
+    parts = [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]
+    assert balancer.session_key({}, parts) == balancer.session_key({}, [{"role": "user", "content": "ab"}])
+
+
+def test_a_conversation_stays_on_one_backend_across_calls():
+    lb = LeastInFlight(choice=_first)
+    deps = [_dep(i) for i in range(1, 5)]
+    conv = _conv("card t_1: commit the fix")
+    homes = set()
+    for n in range(6):
+        homes.add(backend_key(_filter_conv(lb, deps, "c%d" % n, conv)))
+        _success(lb, "c%d" % n)
+    assert len(homes) == 1
+
+
+def test_conversations_spread_over_the_backends():
+    lb = LeastInFlight(choice=_first)
+    deps = [_dep(i) for i in range(1, 5)]
+    homes = collections.Counter()
+    for n in range(40):
+        homes[backend_key(_filter_conv(lb, deps, "c%d" % n, _conv("task %d" % n)))] += 1
+        _success(lb, "c%d" % n)
+    assert len(homes) == 4 and min(homes.values()) >= 4
+
+
+def test_a_busy_home_spills_to_least_in_flight_beyond_the_slack():
+    lb = LeastInFlight(choice=_first, affinity_slack=2)
+    deps = [_dep(1), _dep(2)]
+    conv = _conv("sticky")
+    home = backend_key(_filter_conv(lb, deps, "h", conv))
+    _success(lb, "h")
+    other = next(backend_key(d) for d in deps if backend_key(d) != home)
+    for n in range(2):  # home at 2 in flight, other at 0: still within slack
+        _filter_conv(lb, [d for d in deps if backend_key(d) == home], "load%d" % n)
+    assert backend_key(_filter_conv(lb, deps, "s1", conv)) == home
+    _filter_conv(lb, [d for d in deps if backend_key(d) == home], "load2")  # home now 4 vs 0
+    assert backend_key(_filter_conv(lb, deps, "s2", conv)) == other
+
+
+def test_a_faulted_home_is_not_preferred():
+    lb = LeastInFlight(choice=_first)
+    deps = [_dep(1), _dep(2)]
+    conv = _conv("sticky")
+    home = backend_key(_filter_conv(lb, deps, "h", conv))
+    _attempt_failed(lb, "h", home, _StatusError(503))
+    assert backend_key(_filter_conv(lb, deps, "after", conv)) != home
+
+
+def test_a_retry_leaves_the_home_it_already_tried():
+    lb = LeastInFlight(choice=_first)
+    deps = [_dep(1), _dep(2), _dep(3)]
+    conv = _conv("sticky")
+    home = backend_key(_filter_conv(lb, deps, "r", conv))
+    _attempt_failed(lb, "r", home, _StatusError(400))  # client error: no fault, but already tried
+    assert backend_key(_filter_conv(lb, deps, "r", conv)) != home
+    assert sum(lb.in_flight().values()) == 1
+
+
+def test_removing_a_backend_moves_only_its_conversations():
+    deps = [_dep(i) for i in range(1, 5)]
+    convs = [_conv("task %d" % n) for n in range(40)]
+
+    def homes(candidates):
+        lb = LeastInFlight(choice=_first, affinity_slack=10**6)
+        out = []
+        for n, conv in enumerate(convs):
+            out.append(backend_key(_filter_conv(lb, candidates, "c%d" % n, conv)))
+            _success(lb, "c%d" % n)
+        return out
+
+    before, after = homes(deps), homes(deps[:3])
+    gone = backend_key(deps[3])
+    assert all(a == b for a, b in zip(before, after, strict=True) if a != gone)
+    assert any(a == gone for a in before)
+
+
 def test_module_exposes_the_instance_litellm_loads():
     assert isinstance(balancer.handler, LeastInFlight)
 

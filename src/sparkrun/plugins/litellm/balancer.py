@@ -27,6 +27,16 @@ How a request is placed:
   trace id is only a fallback: clients set it from ``x-litellm-trace-id`` /
   ``x-litellm-session-id`` to group a whole session, so concurrent requests
   routinely share one, and keying on it would collapse them into one slot.
+* Requests of one conversation prefer one backend, so its vLLM prefix
+  cache keeps the conversation's prompt (an agent re-sends 100K+ tokens
+  of history on every call).  The conversation is the client's
+  ``x-litellm-session-id`` when it sends one, else a hash of the start of
+  the system prompt plus the first user message.  Its backend is the
+  rendezvous-hash winner among the least-faulted candidates, taken only
+  while that backend has at most ``affinity_slack`` more requests in
+  flight than the least loaded one; otherwise the request falls back to
+  least-in-flight.  A backend joining or leaving moves only the
+  conversations it wins or held.
 * A retry or fallback re-enters the filter with the same id, moves its
   reservation instead of taking a second one, and prefers a backend that
   request has not tried yet.
@@ -57,6 +67,7 @@ the same backend (a one-backend model, or every backend already tried).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import threading
 import time
@@ -75,6 +86,10 @@ else:  # pragma: no cover - runs inside the LiteLLM gateway process
 STRATEGY = "least-in-flight"
 STALE_AFTER_S = 900.0
 FAULT_AVOID_S = 10.0
+AFFINITY_SLACK = 2
+#: How much of the system prompt identifies a conversation.  Its head is the
+#: agent's fixed persona; a tail may carry per-call context (time, memory).
+_SYSTEM_HEAD_CHARS = 2000
 
 #: HTTP statuses that describe the request rather than the backend: a
 #: malformed or oversized request fails the same way wherever it is sent.
@@ -114,6 +129,44 @@ def _request_keys(kwargs: dict[str, Any] | None) -> list[str]:
     return keys
 
 
+def _text(content: Any) -> str:
+    """Plain text of a chat message's ``content`` (a string or a list of parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(p.get("text") or "") if isinstance(p, dict) else str(p) for p in content)
+    return ""
+
+
+def session_key(request_kwargs: dict[str, Any] | None, messages: Any = None) -> str | None:
+    """Identity of the conversation a request belongs to, or None.
+
+    An explicit ``x-litellm-session-id`` (``litellm_session_id``) wins; the
+    trace id is not used because LiteLLM fills it per request when the
+    client sent none.  Otherwise the conversation is the head of its system
+    prompt plus its first user message, which an agent loop re-sends
+    unchanged on every call until it compacts its history.
+    """
+    kwargs = request_kwargs or {}
+    explicit = kwargs.get("litellm_session_id") or ((kwargs.get("metadata") or {}).get("session_id"))
+    if explicit:
+        return "session:%s" % explicit
+    if not isinstance(messages, list):
+        return None
+    system = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
+    first_user = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"), None)
+    if first_user is None:
+        return None
+    head = _text(system.get("content"))[:_SYSTEM_HEAD_CHARS] if system else ""
+    digest = hashlib.blake2b(("%s\0%s" % (head, _text(first_user.get("content")))).encode(), digest_size=16)
+    return "prompt:%s" % digest.hexdigest()
+
+
+def _affinity(session: str, backend: str) -> int:
+    """Rendezvous-hash weight of *backend* for *session*; the highest wins."""
+    return int.from_bytes(hashlib.blake2b(("%s|%s" % (session, backend)).encode(), digest_size=8).digest(), "big")
+
+
 def _event_backend(kwargs: dict[str, Any] | None) -> str | None:
     """Backend a logging event's attempt went to, when the event says."""
     base = str(((kwargs or {}).get("litellm_params") or {}).get("api_base") or "").rstrip("/")
@@ -145,12 +198,14 @@ class LeastInFlight(CustomLogger):
         fault_avoid: float = FAULT_AVOID_S,
         clock: Callable[[], float] = time.monotonic,
         choice: Callable[[list], Any] = random.choice,
+        affinity_slack: int = AFFINITY_SLACK,
     ) -> None:
         if CustomLogger is not object:
             super().__init__()
         self._lock = threading.Lock()
         self._stale_after = stale_after
         self._fault_avoid = fault_avoid
+        self._affinity_slack = affinity_slack
         self._clock = clock
         self._choice = choice
         self._in_flight: dict[str, int] = {}
@@ -218,8 +273,12 @@ class LeastInFlight(CustomLogger):
         if backend:
             self._faulted[backend] = self._clock()
 
-    def pick(self, deployments: list[dict[str, Any]], key: str | None) -> dict[str, Any]:
-        """Choose one deployment and reserve a slot on its backend for request *key*."""
+    def pick(self, deployments: list[dict[str, Any]], key: str | None, session: str | None = None) -> dict[str, Any]:
+        """Choose one deployment and reserve a slot on its backend for request *key*.
+
+        With a *session*, its rendezvous-hash backend wins while it is within
+        ``affinity_slack`` of the least loaded candidate (see the module doc).
+        """
         with self._lock:
             self._expire_locked()
             tried: set[str] = set()
@@ -230,7 +289,14 @@ class LeastInFlight(CustomLogger):
             candidates = fresh or deployments
             ranks = [(backend_key(d) in self._faulted, self._in_flight.get(backend_key(d), 0)) for d in candidates]
             best = min(ranks)
-            chosen = self._choice([d for d, rank in zip(candidates, ranks, strict=True) if rank == best])
+            chosen = None
+            if session is not None:
+                peers = [(d, rank) for d, rank in zip(candidates, ranks, strict=True) if rank[0] == best[0]]
+                home, home_rank = max(peers, key=lambda p: _affinity(session, backend_key(p[0])))
+                if home_rank[1] <= best[1] + self._affinity_slack:
+                    chosen = home
+            if chosen is None:
+                chosen = self._choice([d for d, rank in zip(candidates, ranks, strict=True) if rank == best])
             if key is not None:
                 backend = backend_key(chosen)
                 now = self._clock()
@@ -290,7 +356,7 @@ class LeastInFlight(CustomLogger):
         if not healthy_deployments:
             return healthy_deployments
         keys = _request_keys(request_kwargs)
-        return [self.pick(list(healthy_deployments), keys[0] if keys else None)]
+        return [self.pick(list(healthy_deployments), keys[0] if keys else None, session_key(request_kwargs, messages))]
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
         self.release(kwargs)
