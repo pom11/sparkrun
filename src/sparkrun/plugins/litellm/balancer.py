@@ -68,6 +68,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 import random
 import threading
 import time
@@ -199,6 +201,7 @@ class LeastInFlight(CustomLogger):
         clock: Callable[[], float] = time.monotonic,
         choice: Callable[[list], Any] = random.choice,
         affinity_slack: int = AFFINITY_SLACK,
+        stats_path: str | None = None,
     ) -> None:
         if CustomLogger is not object:
             super().__init__()
@@ -206,6 +209,12 @@ class LeastInFlight(CustomLogger):
         self._stale_after = stale_after
         self._fault_avoid = fault_avoid
         self._affinity_slack = affinity_slack
+        #: (reason, backend) -> picks; reason is "choiceN" (the conversation's
+        #: N-th preference) or "no-session".  Written to *stats_path* at most
+        #: once a minute so an operator can see how traffic is placed.
+        self._picks: dict[tuple[str, str], int] = {}
+        self._stats_path = stats_path
+        self._stats_written = 0.0
         self._clock = clock
         self._choice = choice
         self._in_flight: dict[str, int] = {}
@@ -269,6 +278,30 @@ class LeastInFlight(CustomLogger):
         for backend in [b for b, at in self._faulted.items() if at < fault_cutoff]:
             del self._faulted[backend]
 
+    def pick_stats(self) -> dict[str, dict[str, int]]:
+        """Snapshot of reason -> backend -> picks since start."""
+        with self._lock:
+            out: dict[str, dict[str, int]] = {}
+            for (reason, backend), n in self._picks.items():
+                out.setdefault(reason, {})[backend] = n
+            return out
+
+    def _record_pick_locked(self, reason: str, deployment: dict[str, Any]) -> None:
+        key = (reason, backend_key(deployment))
+        self._picks[key] = self._picks.get(key, 0) + 1
+        now = self._clock()
+        if self._stats_path and now - self._stats_written >= 60.0:
+            self._stats_written = now
+            stats: dict[str, dict[str, int]] = {}
+            for (r, b), n in self._picks.items():
+                stats.setdefault(r, {})[b] = n
+            try:
+                with open(self._stats_path + ".tmp", "w") as f:
+                    json.dump({"written_at": time.time(), "picks": stats}, f, indent=1, sort_keys=True)
+                os.replace(self._stats_path + ".tmp", self._stats_path)
+            except OSError:
+                pass  # observability only; never fail a pick over it
+
     def _mark_fault_locked(self, backend: str | None) -> None:
         if backend:
             self._faulted[backend] = self._clock()
@@ -291,12 +324,22 @@ class LeastInFlight(CustomLogger):
             best = min(ranks)
             chosen = None
             if session is not None:
+                # The conversation's backends in its own fixed preference
+                # order: the first within slack wins, so a busy home spills
+                # to the same second choice every time (whose cache then
+                # holds the conversation too), never to whichever backend
+                # happens to be idle.  The least loaded peer always
+                # qualifies, so this always picks.
                 peers = [(d, rank) for d, rank in zip(candidates, ranks, strict=True) if rank[0] == best[0]]
-                home, home_rank = max(peers, key=lambda p: _affinity(session, backend_key(p[0])))
-                if home_rank[1] <= best[1] + self._affinity_slack:
-                    chosen = home
+                peers.sort(key=lambda p: _affinity(session, backend_key(p[0])), reverse=True)
+                for order, (d, rank) in enumerate(peers):
+                    if rank[1] <= best[1] + self._affinity_slack:
+                        chosen = d
+                        self._record_pick_locked("choice%d" % (order + 1), d)
+                        break
             if chosen is None:
                 chosen = self._choice([d for d, rank in zip(candidates, ranks, strict=True) if rank == best])
+                self._record_pick_locked("no-session", chosen)
             if key is not None:
                 backend = backend_key(chosen)
                 now = self._clock()
@@ -388,4 +431,10 @@ class LeastInFlight(CustomLogger):
         self.release_failed_attempt(kwargs)
 
 
-handler = LeastInFlight()
+#: Inside the gateway the stats land next to the generated config (the proxy
+#: state directory); imported by sparkrun itself, nothing is written.
+handler = LeastInFlight(
+    stats_path=None
+    if __name__ == "sparkrun.plugins.litellm.balancer"
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "balancer_stats.json")
+)

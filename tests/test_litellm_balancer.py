@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import importlib.util
+import json
 import sys
 import types
 
@@ -422,6 +423,36 @@ def test_a_busy_home_spills_to_least_in_flight_beyond_the_slack():
     assert backend_key(_filter_conv(lb, deps, "s1", conv)) == home
     _filter_conv(lb, [d for d in deps if backend_key(d) == home], "load2")  # home now 4 vs 0
     assert backend_key(_filter_conv(lb, deps, "s2", conv)) == other
+
+
+def test_a_busy_home_spills_to_the_same_second_choice_every_time():
+    lb = LeastInFlight(choice=_first, affinity_slack=0)
+    deps = [_dep(i) for i in range(1, 5)]
+    conv = _conv("sticky")
+    order = sorted((backend_key(d) for d in deps), key=lambda b: balancer._affinity(balancer.session_key({}, conv), b), reverse=True)
+    home, second = order[0], order[1]
+    _filter_conv(lb, [d for d in deps if backend_key(d) == home], "busy")  # home at 1, the rest at 0
+    targets = set()
+    for n in range(5):
+        targets.add(backend_key(_filter_conv(lb, deps, "s%d" % n, conv)))
+        _success(lb, "s%d" % n)
+    assert targets == {second}
+    assert lb.pick_stats()["choice2"] == {second: 5}
+
+
+def test_pick_stats_are_written_at_most_once_a_minute(tmp_path):
+    clock = _Clock()
+    path = tmp_path / "stats.json"
+    lb = LeastInFlight(choice=_first, clock=clock, stats_path=str(path))
+    deps = [_dep(1), _dep(2)]
+    _filter_conv(lb, deps, "a", _conv("x"))
+    first = path.read_text()
+    _filter_conv(lb, deps, "b")
+    assert path.read_text() == first
+    clock.now += 61
+    _filter_conv(lb, deps, "c", _conv("y"))
+    picks = json.loads(path.read_text())["picks"]
+    assert sum(picks["choice1"].values()) == 2 and sum(picks["no-session"].values()) == 1
 
 
 def test_a_faulted_home_is_not_preferred():
