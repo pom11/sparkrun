@@ -386,6 +386,15 @@ at random:
 - The slot is reserved when the backend is picked and released when the
   request succeeds or fails, including after retries. A reservation that sees
   neither expires after 15 minutes.
+- Once a streaming response has yielded its first chunk, inter-chunk silence is
+  measured: the largest gap and counts over 60, 120, 300 and 600 seconds are
+  written to `balancer_stats.json` beside the generated config. Measurement
+  never times out or blames a backend by default, because a preempted vLLM
+  stream can be silently re-prefilling for hundreds of seconds. Setting
+  `SPARKRUN_BALANCER_CHUNK_GAP_S` to a positive number of seconds makes a gap
+  past that threshold release the slot as a backend fault and raise
+  `TimeoutError`. Time to first chunk is never capped, so long prefills are
+  unaffected.
 - A retry or fallback goes to a backend that request has not tried yet, when
   the model has one.
 - A backend whose request just failed on its side (anything but a malformed or

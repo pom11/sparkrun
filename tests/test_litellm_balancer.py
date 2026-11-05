@@ -11,6 +11,7 @@ import collections
 import importlib.util
 import json
 import sys
+import time
 import types
 
 import pytest
@@ -462,18 +463,120 @@ def test_cancellation_while_waiting_for_next_chunk_keeps_fault_false():
     assert lb.faulted() == set()
 
 
-def test_chunk_gap_defaults_and_env_override(monkeypatch):
-    assert CHUNK_GAP_S >= 120.0
+def test_gap_timeout_message_formats_the_measured_numbers():
+    """The raised message must carry the actual gap and configured limit, not placeholders."""
+    clock = _Clock()
+    lb = LeastInFlight(choice=_first, clock=clock, chunk_gap=0.01)
+
+    async def stall_after_first():
+        yield "first-chunk"
+        clock.now += 130.0
+        await asyncio.sleep(10)
+
+    _filter(lb, [_dep(1)], "message")
+
+    async def consume():
+        async for _ in lb.async_post_call_streaming_iterator_hook(None, stall_after_first(), {"litellm_call_id": "message"}):
+            pass
+
+    with pytest.raises(TimeoutError) as caught:
+        asyncio.run(consume())
+    assert str(caught.value) == "stream connection terminated after 130.0s without a chunk (limit 0.01s)"
+
+
+def test_default_measures_chunk_gaps_without_timing_out(tmp_path, monkeypatch):
+    """Unset env is measure-only: a gap past every bucket is recorded and the stream still completes."""
     monkeypatch.delenv(CHUNK_GAP_ENV, raising=False)
-    assert LeastInFlight()._chunk_gap == CHUNK_GAP_S
+    clock = _Clock()
+    path = tmp_path / "stats.json"
+    lb = LeastInFlight(choice=_first, clock=clock, stats_path=str(path))
+    assert lb._chunk_gap is None
+
+    async def slow_but_alive():
+        yield "first"
+        clock.now += 700.0  # far past 120 s and every measurement bucket
+        yield "second"
+
+    _filter(lb, [_dep(1)], "measure")
+
+    async def consume_all():
+        return [c async for c in lb.async_post_call_streaming_iterator_hook(None, slow_but_alive(), {"litellm_call_id": "measure"})]
+
+    assert asyncio.run(consume_all()) == ["first", "second"]
+    assert lb.in_flight() == {backend_key(_dep(1)): 1}
+    assert lb.faulted() == set()
+    assert lb.chunk_gap_stats() == {
+        "over_60s": 1,
+        "over_120s": 1,
+        "over_300s": 1,
+        "over_600s": 1,
+        "max_s": 700.0,
+        "samples": 1,
+    }
+    gaps = json.loads(path.read_text())["chunk_gaps"]
+    assert gaps == lb.chunk_gap_stats()
+    _success(lb, "measure")
+    assert lb.in_flight() == {}
+
+
+def test_close_stream_bounds_an_aclose_that_never_returns(monkeypatch):
+    """A black-holed upstream socket must not stall the wrapper closing a dead stream."""
+    monkeypatch.setattr(balancer, "CLOSE_TIMEOUT_S", 0.05)
+    lb = LeastInFlight(choice=_first, chunk_gap=0.01)
+
+    class _HangingCloseStream:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return "chunk-0"
+            await asyncio.sleep(60)
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(60)
+
+    _filter(lb, [_dep(1)], "hanging-close")
+
+    async def consume():
+        async for _ in lb.async_post_call_streaming_iterator_hook(None, _HangingCloseStream(), {"litellm_call_id": "hanging-close"}):
+            pass
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="stream connection terminated"):
+        asyncio.run(consume())
+    assert time.monotonic() - started < 1.0
+    assert lb.in_flight() == {}
+    assert lb.faulted() == {backend_key(_dep(1))}
+
+
+def test_close_stream_propagates_cancelled_error():
+    """Cancellation is not swallowed by best-effort close handling."""
+
+    class _CancelOnClose:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(balancer._close_stream(_CancelOnClose()))
+
+
+def test_chunk_gap_is_measure_only_by_default_and_env_enables_enforcement(monkeypatch):
+    assert CHUNK_GAP_S is None
+    monkeypatch.delenv(CHUNK_GAP_ENV, raising=False)
+    assert LeastInFlight()._chunk_gap is None
 
     monkeypatch.setenv(CHUNK_GAP_ENV, "180.5")
     assert LeastInFlight()._chunk_gap == 180.5
     assert LeastInFlight(chunk_gap=45.0)._chunk_gap == 45.0
 
-    for invalid in ("not-a-number", "0", "-10"):
+    for invalid in ("not-a-number", "0", "-10", ""):
         monkeypatch.setenv(CHUNK_GAP_ENV, invalid)
-        assert LeastInFlight()._chunk_gap == CHUNK_GAP_S
+        assert LeastInFlight()._chunk_gap is None
 
 
 def test_late_failure_event_for_an_earlier_attempt_keeps_the_retry_slot():

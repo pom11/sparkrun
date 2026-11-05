@@ -54,13 +54,17 @@ How a request is placed:
   late event for an earlier attempt and leaves the retry's slot alone.
   A client that hangs up mid-stream produces no logging event at all, so
   the proxy's stream wrapper releases those (without blaming the backend).
-  Once a stream has yielded its first chunk, an inter-chunk silence longer
-  than ``chunk_gap`` seconds (``SPARKRUN_BALANCER_CHUNK_GAP_S``, default
-  120 s) is treated as a dead upstream stream: the wrapper closes the
-  upstream response, releases the slot with ``fault=True``, and raises
-  ``TimeoutError``.  Time to first chunk is not capped by ``chunk_gap`` so
-  long prefills are unaffected.  Reservations that see none of these expire
-  after ``stale_after`` seconds so a backend cannot stay "busy" forever.
+  Once a stream has yielded its first chunk, the wrapper measures every
+  inter-chunk gap: the largest seen and counts over 60, 120, 300 and 600
+  seconds are recorded in ``balancer_stats.json``.  Measurement alone never
+  times out or blames the backend, because a preempted vLLM stream can be
+  honestly silent for hundreds of seconds while it re-prefills.  Setting
+  ``SPARKRUN_BALANCER_CHUNK_GAP_S`` to a positive number of seconds turns
+  that threshold into enforcement: the wrapper closes the upstream
+  response, releases the slot with ``fault=True``, and raises
+  ``TimeoutError``.  Time to first chunk is never capped so long prefills
+  are unaffected.  Reservations that see none of these expire after
+  ``stale_after`` seconds so a backend cannot stay "busy" forever.
 
 Known undercounts, both bounded to the requests involved and never a leak:
 a comma-separated ``model`` (LiteLLM's batch completion) fans one call id
@@ -94,11 +98,16 @@ STRATEGY = "least-in-flight"
 STALE_AFTER_S = 900.0
 FAULT_AVOID_S = 10.0
 AFFINITY_SLACK = 2
-#: Conservative inter-chunk silence threshold (seconds) after the first
-#: streaming chunk has arrived.  Override via ``SPARKRUN_BALANCER_CHUNK_GAP_S``
-#: or ``LeastInFlight(chunk_gap=...)``.
-CHUNK_GAP_S = 120.0
+#: Inter-chunk silence threshold (seconds) after the first streaming chunk.
+#: ``None`` means measure only: never time out, never fault.  Enable
+#: enforcement with ``SPARKRUN_BALANCER_CHUNK_GAP_S`` or
+#: ``LeastInFlight(chunk_gap=...)``.
+CHUNK_GAP_S: float | None = None
 CHUNK_GAP_ENV = "SPARKRUN_BALANCER_CHUNK_GAP_S"
+#: Upper bound for closing one upstream stream; a black-holed socket must not
+#: stall the wrapper that is already unwinding a dead stream.
+CLOSE_TIMEOUT_S = 5.0
+_GAP_BUCKETS = (60.0, 120.0, 300.0, 600.0)
 #: How much of the system prompt identifies a conversation.  Its head is the
 #: agent's fixed persona; a tail may carry per-call context (time, memory).
 _SYSTEM_HEAD_CHARS = 2000
@@ -108,17 +117,16 @@ _SYSTEM_HEAD_CHARS = 2000
 _REQUEST_FAULT_STATUSES = frozenset({400, 413, 422, 499})
 
 
-def _default_chunk_gap() -> float:
-    """Configured inter-chunk silence threshold in seconds, or :data:`CHUNK_GAP_S`."""
+def _default_chunk_gap() -> float | None:
+    """Configured inter-chunk silence threshold in seconds, or ``None`` to only measure."""
     raw = os.environ.get(CHUNK_GAP_ENV)
-    if raw is not None:
-        try:
-            value = float(raw)
-            if value > 0:
-                return value
-        except ValueError:
-            pass
-    return CHUNK_GAP_S
+    if raw is None or not raw.strip():
+        return CHUNK_GAP_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return CHUNK_GAP_S
+    return value if value > 0 else CHUNK_GAP_S
 
 
 async def _close_stream(response: Any, iterator: Any = None) -> None:
@@ -128,16 +136,17 @@ async def _close_stream(response: Any, iterator: Any = None) -> None:
         aclose = getattr(target, "aclose", None)
         if aclose is not None:
             try:
-                await aclose()
-            except BaseException:
-                pass
+                async with asyncio.timeout(CLOSE_TIMEOUT_S):
+                    await aclose()
+            except Exception:
+                pass  # best effort; CancelledError must still propagate
         else:
             close = getattr(target, "close", None)
             if close is not None:
                 try:
                     close()
-                except BaseException:
-                    pass
+                except Exception:
+                    pass  # best effort; CancelledError must still propagate
 
 
 def backend_key(deployment: dict[str, Any]) -> str:
@@ -259,6 +268,10 @@ class LeastInFlight(CustomLogger):
         self._picks: dict[tuple[str, str], int] = {}
         self._stats_path = stats_path
         self._stats_written = 0.0
+        #: inter-chunk silence measurements; cumulative "over Ns" buckets and max.
+        self._gap_counts: dict[str, int] = {"over_%ds" % int(b): 0 for b in _GAP_BUCKETS}
+        self._gap_max = 0.0
+        self._gap_samples = 0
         self._clock = clock
         self._choice = choice
         self._in_flight: dict[str, int] = {}
@@ -330,21 +343,57 @@ class LeastInFlight(CustomLogger):
                 out.setdefault(reason, {})[backend] = n
             return out
 
+    def chunk_gap_stats(self) -> dict[str, float | int]:
+        """Snapshot of measured inter-chunk silence buckets, max and sample count."""
+        with self._lock:
+            return self._gap_stats_locked()
+
+    def _gap_stats_locked(self) -> dict[str, float | int]:
+        return {**self._gap_counts, "max_s": self._gap_max, "samples": self._gap_samples}
+
+    def _record_gap(self, gap: float) -> None:
+        with self._lock:
+            self._record_gap_locked(gap)
+            self._maybe_write_stats_locked()
+
+    def _record_gap_locked(self, gap: float) -> None:
+        self._gap_samples += 1
+        if gap > self._gap_max:
+            self._gap_max = gap
+        for bucket in _GAP_BUCKETS:
+            if gap > bucket:
+                self._gap_counts["over_%ds" % int(bucket)] += 1
+
+    def _write_stats_locked(self) -> None:
+        if not self._stats_path:
+            return
+        stats: dict[str, dict[str, int]] = {}
+        for (reason, backend), n in self._picks.items():
+            stats.setdefault(reason, {})[backend] = n
+        payload = {
+            "written_at": time.time(),
+            "picks": stats,
+            "chunk_gaps": self._gap_stats_locked(),
+        }
+        try:
+            with open(self._stats_path + ".tmp", "w") as f:
+                json.dump(payload, f, indent=1, sort_keys=True)
+            os.replace(self._stats_path + ".tmp", self._stats_path)
+        except OSError:
+            pass  # observability only; never fail a request over it
+
+    def _maybe_write_stats_locked(self) -> None:
+        if not self._stats_path:
+            return
+        now = self._clock()
+        if now - self._stats_written >= 60.0:
+            self._stats_written = now
+            self._write_stats_locked()
+
     def _record_pick_locked(self, reason: str, deployment: dict[str, Any]) -> None:
         key = (reason, backend_key(deployment))
         self._picks[key] = self._picks.get(key, 0) + 1
-        now = self._clock()
-        if self._stats_path and now - self._stats_written >= 60.0:
-            self._stats_written = now
-            stats: dict[str, dict[str, int]] = {}
-            for (r, b), n in self._picks.items():
-                stats.setdefault(r, {})[b] = n
-            try:
-                with open(self._stats_path + ".tmp", "w") as f:
-                    json.dump({"written_at": time.time(), "picks": stats}, f, indent=1, sort_keys=True)
-                os.replace(self._stats_path + ".tmp", self._stats_path)
-            except OSError:
-                pass  # observability only; never fail a pick over it
+        self._maybe_write_stats_locked()
 
     def _mark_fault_locked(self, backend: str | None) -> None:
         if backend:
@@ -460,27 +509,34 @@ class LeastInFlight(CustomLogger):
         # Proxy-only.  A client that disconnects mid-stream closes this
         # generator (or cancels the task iterating it) and LiteLLM logs no
         # event for that request at all.  Once the first chunk has arrived
-        # (any yielded SSE chunk, including reasoning deltas), an inter-chunk
-        # silence exceeding _chunk_gap is a dead upstream stream: release the
-        # reservation with fault=True, close the upstream stream, and raise.
+        # (any yielded SSE chunk, including reasoning deltas), every
+        # inter-chunk gap is measured.  Measurement never enforces: a
+        # preempted backend can be honestly silent while it re-prefills.
+        # Only an explicitly configured _chunk_gap turns a gap into a dead
+        # upstream stream: release the reservation with fault=True, close
+        # the upstream stream, and raise.
         iterator = aiter(response)
         last_chunk_at: float | None = None
         try:
             while True:
                 try:
-                    if last_chunk_at is None:
+                    if last_chunk_at is None or self._chunk_gap is None:
                         chunk = await anext(iterator)
+                        if last_chunk_at is not None:
+                            self._record_gap(self._clock() - last_chunk_at)
                     else:
                         try:
                             async with asyncio.timeout(self._chunk_gap):
                                 chunk = await anext(iterator)
                         except TimeoutError as exc:
                             gap = self._clock() - last_chunk_at
+                            self._record_gap(gap)
                             self.release_request(request_data, exc, fault=True)
                             await _close_stream(response, iterator)
                             raise TimeoutError(
-                                "stream connection terminated after %.1fs without a chunk (limit %.1fs)" % (gap, self._chunk_gap)
+                                "stream connection terminated after %.1fs without a chunk (limit %gs)" % (gap, self._chunk_gap)
                             ) from exc
+                        self._record_gap(self._clock() - last_chunk_at)
                 except StopAsyncIteration:
                     break
                 last_chunk_at = self._clock()
