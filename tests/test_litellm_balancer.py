@@ -11,10 +11,13 @@ import collections
 import importlib.util
 import json
 import sys
+import time
 import types
 
+import pytest
+
 from sparkrun.plugins.litellm import balancer
-from sparkrun.plugins.litellm.balancer import LeastInFlight, backend_key, is_backend_fault
+from sparkrun.plugins.litellm.balancer import CHUNK_GAP_ENV, CHUNK_GAP_S, LeastInFlight, backend_key, is_backend_fault
 
 
 def _dep(i: int, model: str = "org/model-a", alias: str | None = None) -> dict:
@@ -306,6 +309,274 @@ def test_completed_stream_is_left_to_the_success_event():
     assert sum(lb.in_flight().values()) == 1
     _success(lb, "c")
     assert lb.in_flight() == {}
+
+
+def test_dead_stream_after_first_chunk_releases_with_fault_and_closes_upstream():
+    """A stream that goes silent after yielding its first chunk is released as a backend fault and closed."""
+    lb = LeastInFlight(choice=_first, chunk_gap=0.03)
+    dep1, dep2 = _dep(1), _dep(2)
+    closed = {"gen": False, "aclose": False}
+
+    class _StallingStream:
+        def __init__(self) -> None:
+            self._gen = self._iterate()
+
+        async def _iterate(self):
+            try:
+                yield "first-chunk"
+                await asyncio.sleep(10)
+            finally:
+                closed["gen"] = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self._gen.__anext__()
+
+        async def aclose(self) -> None:
+            closed["aclose"] = True
+            await self._gen.aclose()
+
+    _filter(lb, [dep1, dep2], "dead")
+    _filter(lb, [dep1], "sibling")  # keep a second slot on dep1 to prove no double-release
+    assert lb.in_flight() == {backend_key(dep1): 2}
+
+    async def consume():
+        return [c async for c in lb.async_post_call_streaming_iterator_hook(None, _StallingStream(), {"litellm_call_id": "dead"})]
+
+    with pytest.raises(TimeoutError, match="stream connection terminated"):
+        asyncio.run(consume())
+
+    assert closed == {"gen": True, "aclose": True}
+    assert lb.in_flight() == {backend_key(dep1): 1}
+    assert lb.faulted() == {backend_key(dep1)}
+
+    # LiteLLM's async_data_generator runs post_call_failure_hook on exception; neither
+    # that nor a late failure logging event may decrement dep1's remaining slot.
+    asyncio.run(lb.async_post_call_failure_hook({"litellm_call_id": "dead"}, TimeoutError("gap"), None))
+    _attempt_failed(lb, "dead", backend_key(dep1), TimeoutError("gap"))
+    lb.log_failure_event(_event("dead", backend_key(dep1), TimeoutError("gap")), None, 0, 0)
+    assert lb.in_flight() == {backend_key(dep1): 1}
+    assert lb.faulted() == {backend_key(dep1)}
+
+
+def test_dead_stream_closes_sync_close_response():
+    """Upstream stream wrappers exposing only sync close() are closed on a chunk gap."""
+    lb = LeastInFlight(choice=_first, chunk_gap=0.02)
+    closed = False
+
+    class _SyncCloseStream:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return "chunk-0"
+            await asyncio.sleep(10)
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    _filter(lb, [_dep(1)], "sync-close")
+
+    async def consume():
+        async for _ in lb.async_post_call_streaming_iterator_hook(None, _SyncCloseStream(), {"litellm_call_id": "sync-close"}):
+            pass
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(consume())
+    assert closed
+    assert lb.in_flight() == {}
+    assert lb.faulted() == {backend_key(_dep(1))}
+
+
+def test_slow_progressing_stream_is_not_released_early():
+    """Inter-chunk gaps below chunk_gap keep resetting last_chunk_at even when total time > chunk_gap."""
+    lb = LeastInFlight(choice=_first, chunk_gap=0.06)
+
+    async def slow_chunks():
+        for i in range(4):
+            if i > 0:
+                await asyncio.sleep(0.02)
+            yield i
+
+    async def consume_all():
+        return [c async for c in lb.async_post_call_streaming_iterator_hook(None, slow_chunks(), {"litellm_call_id": "slow"})]
+
+    _filter(lb, [_dep(1)], "slow")
+    assert asyncio.run(consume_all()) == [0, 1, 2, 3]
+    assert lb.in_flight() == {backend_key(_dep(1)): 1}
+    assert lb.faulted() == set()
+    _success(lb, "slow")
+    assert lb.in_flight() == {}
+
+
+def test_long_time_to_first_chunk_does_not_trigger_chunk_gap():
+    """The gap timer starts only after the first chunk so long prefills are never cut off."""
+    lb = LeastInFlight(choice=_first, chunk_gap=0.02)
+
+    async def slow_prefill():
+        await asyncio.sleep(0.06)  # 3x chunk_gap before the first chunk
+        yield "reasoning-0"
+        await asyncio.sleep(0.005)
+        yield "content-1"
+
+    async def consume_all():
+        return [c async for c in lb.async_post_call_streaming_iterator_hook(None, slow_prefill(), {"litellm_call_id": "prefill"})]
+
+    _filter(lb, [_dep(1)], "prefill")
+    assert asyncio.run(consume_all()) == ["reasoning-0", "content-1"]
+    assert lb.in_flight() == {backend_key(_dep(1)): 1}
+    assert lb.faulted() == set()
+    _success(lb, "prefill")
+    assert lb.in_flight() == {}
+
+
+def test_cancellation_while_waiting_for_next_chunk_keeps_fault_false():
+    """Task cancellation inside the chunk-gap wait must stay CancelledError with fault=False."""
+    lb = LeastInFlight(choice=_first, chunk_gap=0.5)
+
+    async def stall_after_first():
+        yield "first"
+        await asyncio.sleep(10)
+
+    async def cancel_during_gap_wait():
+        async def consume():
+            async for _ in lb.async_post_call_streaming_iterator_hook(None, stall_after_first(), {"litellm_call_id": "cancel"}):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    _filter(lb, [_dep(1)], "cancel")
+    asyncio.run(cancel_during_gap_wait())
+    assert lb.in_flight() == {}
+    assert lb.faulted() == set()
+
+
+def test_gap_timeout_message_formats_the_measured_numbers():
+    """The raised message must carry the actual gap and configured limit, not placeholders."""
+    clock = _Clock()
+    lb = LeastInFlight(choice=_first, clock=clock, chunk_gap=0.01)
+
+    async def stall_after_first():
+        yield "first-chunk"
+        clock.now += 130.0
+        await asyncio.sleep(10)
+
+    _filter(lb, [_dep(1)], "message")
+
+    async def consume():
+        async for _ in lb.async_post_call_streaming_iterator_hook(None, stall_after_first(), {"litellm_call_id": "message"}):
+            pass
+
+    with pytest.raises(TimeoutError) as caught:
+        asyncio.run(consume())
+    assert str(caught.value) == "stream connection terminated after 130.0s without a chunk (limit 0.01s)"
+
+
+def test_default_measures_chunk_gaps_without_timing_out(tmp_path, monkeypatch):
+    """Unset env is measure-only: a gap past every bucket is recorded and the stream still completes."""
+    monkeypatch.delenv(CHUNK_GAP_ENV, raising=False)
+    clock = _Clock()
+    path = tmp_path / "stats.json"
+    lb = LeastInFlight(choice=_first, clock=clock, stats_path=str(path))
+    assert lb._chunk_gap is None
+
+    async def slow_but_alive():
+        yield "first"
+        clock.now += 700.0  # far past 120 s and every measurement bucket
+        yield "second"
+
+    _filter(lb, [_dep(1)], "measure")
+
+    async def consume_all():
+        return [c async for c in lb.async_post_call_streaming_iterator_hook(None, slow_but_alive(), {"litellm_call_id": "measure"})]
+
+    assert asyncio.run(consume_all()) == ["first", "second"]
+    assert lb.in_flight() == {backend_key(_dep(1)): 1}
+    assert lb.faulted() == set()
+    assert lb.chunk_gap_stats() == {
+        "over_60s": 1,
+        "over_120s": 1,
+        "over_300s": 1,
+        "over_600s": 1,
+        "max_s": 700.0,
+        "samples": 1,
+    }
+    gaps = json.loads(path.read_text())["chunk_gaps"]
+    assert gaps == lb.chunk_gap_stats()
+    _success(lb, "measure")
+    assert lb.in_flight() == {}
+
+
+def test_close_stream_bounds_an_aclose_that_never_returns(monkeypatch):
+    """A black-holed upstream socket must not stall the wrapper closing a dead stream."""
+    monkeypatch.setattr(balancer, "CLOSE_TIMEOUT_S", 0.05)
+    lb = LeastInFlight(choice=_first, chunk_gap=0.01)
+
+    class _HangingCloseStream:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return "chunk-0"
+            await asyncio.sleep(60)
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(60)
+
+    _filter(lb, [_dep(1)], "hanging-close")
+
+    async def consume():
+        async for _ in lb.async_post_call_streaming_iterator_hook(None, _HangingCloseStream(), {"litellm_call_id": "hanging-close"}):
+            pass
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="stream connection terminated"):
+        asyncio.run(consume())
+    assert time.monotonic() - started < 1.0
+    assert lb.in_flight() == {}
+    assert lb.faulted() == {backend_key(_dep(1))}
+
+
+def test_close_stream_propagates_cancelled_error():
+    """Cancellation is not swallowed by best-effort close handling."""
+
+    class _CancelOnClose:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(balancer._close_stream(_CancelOnClose()))
+
+
+def test_chunk_gap_is_measure_only_by_default_and_env_enables_enforcement(monkeypatch):
+    assert CHUNK_GAP_S is None
+    monkeypatch.delenv(CHUNK_GAP_ENV, raising=False)
+    assert LeastInFlight()._chunk_gap is None
+
+    monkeypatch.setenv(CHUNK_GAP_ENV, "180.5")
+    assert LeastInFlight()._chunk_gap == 180.5
+    assert LeastInFlight(chunk_gap=45.0)._chunk_gap == 45.0
+
+    for invalid in ("not-a-number", "0", "-10", ""):
+        monkeypatch.setenv(CHUNK_GAP_ENV, invalid)
+        assert LeastInFlight()._chunk_gap is None
 
 
 def test_late_failure_event_for_an_earlier_attempt_keeps_the_retry_slot():
