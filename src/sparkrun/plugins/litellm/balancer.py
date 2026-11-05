@@ -54,8 +54,13 @@ How a request is placed:
   late event for an earlier attempt and leaves the retry's slot alone.
   A client that hangs up mid-stream produces no logging event at all, so
   the proxy's stream wrapper releases those (without blaming the backend).
-  Reservations that see none of these expire after ``stale_after`` seconds
-  so a backend cannot stay "busy" forever.
+  Once a stream has yielded its first chunk, an inter-chunk silence longer
+  than ``chunk_gap`` seconds (``SPARKRUN_BALANCER_CHUNK_GAP_S``, default
+  120 s) is treated as a dead upstream stream: the wrapper closes the
+  upstream response, releases the slot with ``fault=True``, and raises
+  ``TimeoutError``.  Time to first chunk is not capped by ``chunk_gap`` so
+  long prefills are unaffected.  Reservations that see none of these expire
+  after ``stale_after`` seconds so a backend cannot stay "busy" forever.
 
 Known undercounts, both bounded to the requests involved and never a leak:
 a comma-separated ``model`` (LiteLLM's batch completion) fans one call id
@@ -89,6 +94,11 @@ STRATEGY = "least-in-flight"
 STALE_AFTER_S = 900.0
 FAULT_AVOID_S = 10.0
 AFFINITY_SLACK = 2
+#: Conservative inter-chunk silence threshold (seconds) after the first
+#: streaming chunk has arrived.  Override via ``SPARKRUN_BALANCER_CHUNK_GAP_S``
+#: or ``LeastInFlight(chunk_gap=...)``.
+CHUNK_GAP_S = 120.0
+CHUNK_GAP_ENV = "SPARKRUN_BALANCER_CHUNK_GAP_S"
 #: How much of the system prompt identifies a conversation.  Its head is the
 #: agent's fixed persona; a tail may carry per-call context (time, memory).
 _SYSTEM_HEAD_CHARS = 2000
@@ -96,6 +106,38 @@ _SYSTEM_HEAD_CHARS = 2000
 #: HTTP statuses that describe the request rather than the backend: a
 #: malformed or oversized request fails the same way wherever it is sent.
 _REQUEST_FAULT_STATUSES = frozenset({400, 413, 422, 499})
+
+
+def _default_chunk_gap() -> float:
+    """Configured inter-chunk silence threshold in seconds, or :data:`CHUNK_GAP_S`."""
+    raw = os.environ.get(CHUNK_GAP_ENV)
+    if raw is not None:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return CHUNK_GAP_S
+
+
+async def _close_stream(response: Any, iterator: Any = None) -> None:
+    """Close *iterator* and *response* best-effort so a dead stream does not leak its socket."""
+    targets = (iterator, response) if iterator is not None and iterator is not response else (response,)
+    for target in targets:
+        aclose = getattr(target, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except BaseException:
+                pass
+        else:
+            close = getattr(target, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException:
+                    pass
 
 
 def backend_key(deployment: dict[str, Any]) -> str:
@@ -202,6 +244,7 @@ class LeastInFlight(CustomLogger):
         choice: Callable[[list], Any] = random.choice,
         affinity_slack: int = AFFINITY_SLACK,
         stats_path: str | None = None,
+        chunk_gap: float | None = None,
     ) -> None:
         if CustomLogger is not object:
             super().__init__()
@@ -209,6 +252,7 @@ class LeastInFlight(CustomLogger):
         self._stale_after = stale_after
         self._fault_avoid = fault_avoid
         self._affinity_slack = affinity_slack
+        self._chunk_gap = _default_chunk_gap() if chunk_gap is None else chunk_gap
         #: (reason, backend) -> picks; reason is "choiceN" (the conversation's
         #: N-th preference) or "no-session".  Written to *stats_path* at most
         #: once a minute so an operator can see how traffic is placed.
@@ -415,10 +459,31 @@ class LeastInFlight(CustomLogger):
     async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
         # Proxy-only.  A client that disconnects mid-stream closes this
         # generator (or cancels the task iterating it) and LiteLLM logs no
-        # event for that request at all.  Errors raised by the stream itself
-        # still reach the failure hooks, which can blame the backend.
+        # event for that request at all.  Once the first chunk has arrived
+        # (any yielded SSE chunk, including reasoning deltas), an inter-chunk
+        # silence exceeding _chunk_gap is a dead upstream stream: release the
+        # reservation with fault=True, close the upstream stream, and raise.
+        iterator = aiter(response)
+        last_chunk_at: float | None = None
         try:
-            async for chunk in response:
+            while True:
+                try:
+                    if last_chunk_at is None:
+                        chunk = await anext(iterator)
+                    else:
+                        try:
+                            async with asyncio.timeout(self._chunk_gap):
+                                chunk = await anext(iterator)
+                        except TimeoutError as exc:
+                            gap = self._clock() - last_chunk_at
+                            self.release_request(request_data, exc, fault=True)
+                            await _close_stream(response, iterator)
+                            raise TimeoutError(
+                                "stream connection terminated after %.1fs without a chunk (limit %.1fs)" % (gap, self._chunk_gap)
+                            ) from exc
+                except StopAsyncIteration:
+                    break
+                last_chunk_at = self._clock()
                 yield chunk
         except (GeneratorExit, asyncio.CancelledError):
             self.release_request(request_data, fault=False)
